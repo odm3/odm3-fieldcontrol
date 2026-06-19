@@ -1,9 +1,7 @@
 # e6events — System Design
 
-> Project renamed **odm3 → e6events**. The field-controller module is
-> `github.com/odm3/e6events/fieldcontrol`. The component repo names below (`odm3-*`)
-> are retained as the architecture's logical component names; the field controller
-> additionally carries a minimal portal slice for the Phase 1 vertical slice.
+> Project renamed **odm3 → e6events**. Field-controller module: `github.com/odm3/e6events/fieldcontrol`.
+> Component repo names (`odm3-*`) are retained as logical architecture labels.
 
 Design notes for an open, **local-first** tournament stack for RECF Achieve Pinnacle
 (2026–2027): a tournament portal, a field controller, a staff app, displays, and a
@@ -49,6 +47,7 @@ There are only three kinds of node:
 | `odm3-staff`        | React Native + Expo app: queuer check-in, inspection, scoring (one role-gated app). Shares the TS core. |
 | `odm3-display`      | Identical kiosk Pi image (Chromium → a portal display route).     |
 | `odm3-notify`       | Separate notification service (team-facing, may use internet).    |
+| `odm3-fieldcontrol-client` | Java library for FTC/REV teams. Implements the ODM3 UDP open protocol inside a single FTC OpMode. |
 
 ---
 
@@ -77,7 +76,39 @@ role) and recovery (known ID → self-restore) flow through the same mechanism.
 
 ---
 
-## 4. Match lifecycle entity (the spine)
+## 4. Network topology
+
+The tournament LAN runs on existing UniFi infrastructure (AP, switch, gateway)
+carried from VEX tournament setups. ODM3 adds one dedicated VLAN/SSID for field
+control, isolated from the tournament management and team/guest networks.
+
+```
+UniFi Gateway
+├── VLAN 10 — Tournament Management
+│     Portal server, scoring laptops, admin tablets
+├── VLAN 20 — Field Control  (hidden SSID)
+│     Field Pis (ethernet), REV Control Hubs (Wi-Fi), display Pis
+│     Portal server has a leg here to reach field Pis via WebSocket
+└── VLAN 30 — Team / Guest
+      Team laptops, phones, pit devices
+```
+
+**V5 teams** connect via **long USB cables** from each driver station position back
+to the field Pi (or a powered USB hub). No Wi-Fi involvement for V5 field control —
+purely wired, operationally identical to plugging into a VEX field controller today.
+USB active extension cables cover up to 5m passively; active repeaters reach 10–15m.
+Four USB connections per field (one per alliance station).
+
+**REV teams** connect their Control Hub to the hidden field SSID (VLAN 20) instead
+of using Wi-Fi Direct to their Driver Hub. One-time per-device configuration.
+
+The hidden field SSID keeps team devices off the field network. Client isolation,
+MAC whitelisting, and per-SSID bandwidth controls via UniFi keep the field network
+quiet for the latency-sensitive 50ms ODM3 UDP broadcasts.
+
+---
+
+## 5. Match lifecycle entity (the spine)
 
 One entity every client reads, in different projections:
 
@@ -92,7 +123,7 @@ readiness; displays read current match + score; rankings read results.
 
 ---
 
-## 5. Control model
+## 6. Control model
 
 Two orthogonal signals derived from a single `Phase`.
 
@@ -108,18 +139,31 @@ Two orthogonal signals derived from a single `Phase`.
 |---|---|---|---|
 | `idle` | no | none | no match loaded |
 | `pre_match` | no | none | loaded, waiting for start |
+| `countdown_auton` | no | none | 3..2..1 before autonomous — display/driver awareness only |
 | `autonomous` | **yes** | autonomous | autonomous period |
-| `transition` | no | none | disabled pause between auton and driver |
+| `transition` | no | none | disabled pause between auton and driver countdown |
+| `countdown_driver` | no | none | 3..2..1 before driver control — display/driver awareness only |
 | `driver` | **yes** | driver | driver control |
 | `ended` | no | none | completed normally |
 | `estop` | no | none | latched; cleared only by Reset |
 | `fault` | no | none | recovered from interruption; awaits operator |
 
+Countdown phases are disabled. Robots see no signal difference between `pre_match`
+and a countdown — the countdown exists purely for displays and driver awareness.
+`State.CountdownRemaining` carries the countdown timer; `State.Remaining` carries the
+enabled-phase timer. Display Pis render "AUTONOMOUS IN 3..2..1" vs "DRIVER CONTROL IN
+3..2..1" from the phase name.
+
+Full phase sequences:
+- **Alliance:** `pre_match → countdown_auton(3s) → autonomous(15s) → [transition] → countdown_driver(3s) → driver(105s) → ended`
+- **SoloDriving:** `pre_match → countdown_auton(3s) → driver(60s) → ended`
+- **SoloCoding:** `pre_match → countdown_auton(3s) → autonomous(60s) → ended`
+
 Implemented in `match/`.
 
 ---
 
-## 6. Two planes + queue/check-in
+## 7. Two planes + queue/check-in
 
 The portal exposes two WebSocket surfaces:
 
@@ -132,8 +176,8 @@ The portal exposes two WebSocket surfaces:
 
 Transport for the view plane is an **in-process Go pub/sub hub** (local-first; no Redis
 dependency on a single box). The pub/sub *abstraction* stays clean so Redis can slot in
-for large multi-division events. (This is where the VEX Queue work lands — its function,
-not its transport.)
+for large multi-division events. (The queue/check-in subsystem is the queue function built natively into the portal,
+not a separate named product.)
 
 ### Queue & check-in (the Worlds model, improved)
 Queue is presence/readiness, not one-way notification:
@@ -150,7 +194,7 @@ Queue is presence/readiness, not one-way notification:
 
 ---
 
-## 7. Displays
+## 8. Displays
 
 Identical flashed kiosk image; **type assigned from the portal after it's on the
 network** (nothing display-specific baked in). Boots → Chromium kiosk → registers as an
@@ -169,7 +213,7 @@ authoritative timer.
 
 ---
 
-## 8. Notifications
+## 9. Notifications
 
 A **separate service** (`odm3-notify`) that subscribes to the view plane. It's the one
 piece that may want internet (push to teams off the venue Wi-Fi) and has a different
@@ -179,7 +223,7 @@ a dependency of it.
 
 ---
 
-## 9. Staff app
+## 10. Staff app
 
 One React Native + Expo app, one codebase, multiple roles: **queuer check-in,
 inspection, scoring.** Role-gated UI — a volunteer is handed the role they're working.
@@ -194,7 +238,7 @@ UI; true native is reserved for modules RN can't express.
 
 ---
 
-## 10. Fault model & concurrency
+## 11. Fault model & concurrency
 
 - **Live match is Pi-authoritative.** WS drop mid-match → match completes on local clock.
   WS drop between matches → Pi refuses to start a match it can't record.
@@ -208,20 +252,128 @@ UI; true native is reserved for modules RN can't express.
 
 ---
 
-## 11. Open questions
+## 12. Driver layer & open protocol
 
-- **Offline-sync model for the staff app** (the hard one): last-write-wins with a sync
-  queue, or real conflict handling for scoring (two refs on one match, or a stale offline
-  tablet)? Same decision native or RN.
-- **Check-in granularity:** per-slot boolean, or `absent/present/no_show` enum?
-- **Slot assignment:** does the portal push slot→controller mapping, or does the Pi
-  autodiscover and report up for confirmation?
-- V5 competition-port GPIO pin map / RJ45 breakout wiring.
-- View-plane message envelope/versioning.
+Pluggable driver modules implement a common Go interface. The state machine calls
+`SetState(enabled, mode)` on each slot and knows nothing about the protocol behind it.
+
+### Open field control protocol (UDP broadcast)
+
+The field Pi broadcasts an 8-byte UDP packet every **50ms** on port **9800** of the
+field subnet. Every controller platform that can open a UDP socket and parse this packet
+participates in field control — no proprietary hardware, no modified apps.
+
+```
+Offset  Size  Description
+0-3     4B    Magic: 0x4F 0x44 0x4D 0x33  ("ODM3")
+4       1B    Version: 0x01
+5       1B    Flags:
+                bit 0 — enabled  (1 = enabled,    0 = disabled)
+                bit 1 — mode     (1 = driver ctrl, 0 = autonomous)
+                bit 2 — estop    (1 = e-stop latched)
+6-7     2B    Time remaining in current phase, unsigned short, milliseconds (0 when disabled)
+```
+
+Silence = disabled. If a robot stops receiving packets for 500ms it must treat itself
+as disabled — the same conservative failsafe the Pi applies on its own side.
+
+### V5 driver (Y1 MVP)
+
+The V5 controller (handheld gamepad) is the field control endpoint — not the brain.
+The Pi sends the 14-byte USB serial packet decoded from Jerrylum/better-field-control
+over a USB connection to each V5 controller. The controller relays enable/disable and
+autonomous/driver to the brain over VEXnet/BT. Four robots = four USB connections into
+a powered hub on the Pi. No FC brain, no smart cable required.
+
+USB serial protocol (115200 baud, VEX USB VID 0x288):
+```
+C9 36 B8 47 58 C1 05 <state> 00 00 00 00 <crc_hi> <crc_lo>
+
+State byte:  0x0A = autonomous,  0x08 = driver,  0x0B = disabled
+Checksum:    CRC16 over first 12 bytes
+```
+
+### REV Control Hub driver (post-MVP, open electronics)
+
+FTC's current architecture is point-to-point Wi-Fi Direct between the Driver Hub
+(Android, driver station) and the Control Hub (Android, on robot) with no field
+control hook. Teams press Init and Start manually; there is no external kill signal.
+
+The ODM3 solution for RECF teams using REV hardware is the **FieldControlClient**
+library (`odm3-fieldcontrol-client` Java repo). Teams include it in their FTC Android
+Studio project. It runs a background UDP listener on port 9800, receives the ODM3
+open protocol packet, and exposes `isAutonomous()` / `isDriverControl()` / `isEnabled()`
+to the OpMode.
+
+**RecfOpMode base class — mirrors VEXcode/PROS three-callback model:**
+
+```java
+// Teams extend this, override three methods. Mirrors VEXcode pre_auton /
+// autonomous / usercontrol and PROS competition_initialize / autonomous / opcontrol.
+public abstract class RecfOpMode extends LinearOpMode {
+    private final FieldControlClient field = new FieldControlClient();
+
+    public void preAuton() {}          // hardware init, sensor reset, display
+    public abstract void autonomous(); // autonomous period
+    public abstract void driverControl(); // driver control period
+
+    @Override
+    public final void runOpMode() throws InterruptedException {
+        field.start();
+        preAuton();                      // runs while disabled / during countdown
+        field.waitForAutonomous();       // blocks until field enables auto
+        autonomous();
+        field.waitForDriverControl();    // blocks until field transitions to driver
+        driverControl();
+        field.stop();
+    }
+}
+
+// Team's entire robot program:
+@TeleOp(name = "RECF Match", group = "RECF")
+public class MyRobot extends RecfOpMode {
+    @Override public void preAuton()      { /* init hardware */ }
+    @Override public void autonomous()    { /* auto code */     }
+    @Override public void driverControl() { /* driver code */   }
+}
+```
+
+**Rules requirement for REV teams:**
+- Write a single `@TeleOp` OpMode (not separate Autonomous + TeleOp programs)
+- Use `FieldControlClient` to delineate autonomous and driver control periods
+- Select the OpMode, hit **Init** when signaled by the queuer; the field Pi drives
+  everything after that — autonomous start, transition to driver, match end
+- Do not hit Start or Stop manually
+
+This eliminates the FTC manual Init/Start/Stop flow, the autonomous-to-TeleOp gap
+where teams lose seconds, and the DS preselection complexity. The robot's Wi-Fi
+joins the field subnet (not Wi-Fi Direct to the Control Hub), which is the one
+network configuration change teams make once.
+
+The Pi-side REV driver module broadcasts the same open protocol UDP packet as every
+other controller type — no special handling. The library on the robot side is the
+entire REV integration.
+
+### Future drivers
+
+When RECF defines its Y2+ open electronics standard, drivers slot in against the same
+Go interface without touching the state machine. The open protocol UDP packet is already
+the universal field signal for any controller with a network stack.
 
 ---
 
-## 12. Tech stack
+## 13. Open questions
+
+- **Offline-sync model for the staff app:** last-write-wins with a sync queue, or real
+  conflict handling for scoring (two refs on one match, or a stale offline tablet)?
+- **Check-in granularity:** per-slot boolean, or `absent / present / no_show` enum?
+- **Slot assignment:** portal pushes slot→controller mapping in the match config, or
+  Pi autodiscovers and reports up for confirmation?
+- View-plane message envelope/versioning strategy.
+
+---
+
+## 14. Tech stack
 
 - **Pi + portal:** Go. One language across the control plane; the WebSocket contract is
   the *same Go types* on both ends via `odm3-contract`.
@@ -232,27 +384,28 @@ UI; true native is reserved for modules RN can't express.
 - **Staff app:** React Native + Expo, shares the TS core.
 - **Pi images:** Pi OS Lite, process as a `systemd` service on boot; configured portal
   address + hardware-serial device ID; identical image per role-class.
+- **FieldControlClient:** Java library (`odm3-fieldcontrol-client`) for FTC/REV teams.
+  Published as an open source Android library. Implements the ODM3 UDP open protocol.
 - **Testing:** Go `testing` with an injectable `Clock` and mock drivers — full lifecycle
   testable with no hardware.
 
 ---
 
-## 13. Roadmap
+## 15. Roadmap
 
 **Phase 0 — Match core. [DONE]**
 `match/` state machine: alliance / solo driving / solo coding, estop, abort, snapshot +
 failsafe restore. Fully unit-tested.
 
 **Phase 1 — Field-control vertical slice. [IN PROGRESS]**
-`contract` (shared Go WS types) · run loop + driver registry interface · V5 GPIO
-driver (legacy competition port) · portal device registry + registration handshake
-(configured portal address, hardware-serial ID) · minimal portal able to Load/Start/Estop
-one field.
+`contract` (shared Go WS types) · run loop + driver registry interface · V5 USB serial
+driver (14-byte packet, CRC16/CCITT) · portal device registry + registration handshake
+(hardware-serial ID, self-restore across DHCP leases) · minimal portal able to
+Load/Start/Estop/Reset one field · open protocol UDP broadcaster (8-byte, port 9800).
+*Built:* all of the above as fully tested Go packages with injectable clock and mock
+drivers. *Remaining for hardware-done:* WebSocket adapter for `transport.Conn`, real
+Pi USB serial port wrapper behind `driver.Port`, and the VID 0x288 enumeration on-Pi.
 *Done when:* a real V5 robot runs a full match on real hardware, driven end to end.
-*Built so far:* all of the above as testable Go packages (`contract`, `transport`,
-`driver`, `field`, `portal`) with an injectable clock and mock drivers; `cmd/demo`
-runs the full slice in-process. *Remaining:* a WebSocket adapter for `transport.Conn`,
-the real Pi GPIO wrapper behind `driver.Pin`, and the V5 competition-port pin map (§11).
 
 **Phase 2 — Tournament spine.**
 Portal data model (events, teams, match lifecycle entity) on SQLite · match conductor ·
@@ -271,6 +424,6 @@ queuer + inspection + scoring, role-gated, offline sync) · read-only team/pit q
 
 **Phase 5 — Full event + reach.**
 `odm3-notify` service · scheduling algorithms · skills · alliance selection & elims ·
-cloud publish of results.
+cloud publish of results · `odm3-fieldcontrol-client` REV Java library published.
 *Done when:* a complete event runs start to finish, including elims and skills, and
 publishes when online.

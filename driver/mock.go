@@ -6,11 +6,17 @@ import (
 	"github.com/odm3/e6events/fieldcontrol/match"
 )
 
-// Mock is an in-memory Driver that records every Output applied to it, so the full
-// match lifecycle can be tested with no hardware (DESIGN §12).
+// Applied records one call to Mock.Apply.
+type Applied struct {
+	Enabled bool
+	Mode    match.Mode
+}
+
+// Mock is an in-memory Driver that records every Apply call, so the full match
+// lifecycle can be tested with no hardware (DESIGN §14).
 type Mock struct {
 	mu      sync.Mutex
-	Applied []match.Output
+	Applied []Applied
 	Closed  bool
 }
 
@@ -21,19 +27,19 @@ func NewMock() *Mock { return &Mock{} }
 func (m *Mock) Name() string { return "mock" }
 
 // Apply implements Driver.
-func (m *Mock) Apply(o match.Output) error {
+func (m *Mock) Apply(enabled bool, mode match.Mode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Applied = append(m.Applied, o)
+	m.Applied = append(m.Applied, Applied{Enabled: enabled, Mode: mode})
 	return nil
 }
 
-// Last returns the most recently applied output (or the zero Output if none).
-func (m *Mock) Last() match.Output {
+// Last returns the most recently applied call (or zero if none).
+func (m *Mock) Last() Applied {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(m.Applied) == 0 {
-		return match.Output{}
+		return Applied{}
 	}
 	return m.Applied[len(m.Applied)-1]
 }

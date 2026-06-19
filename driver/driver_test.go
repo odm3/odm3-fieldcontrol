@@ -1,6 +1,8 @@
 package driver_test
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/odm3/e6events/fieldcontrol/driver"
@@ -26,93 +28,10 @@ func TestRegistryOpen(t *testing.T) {
 	}
 }
 
-// fakePin records the last level it was driven to.
-type fakePin struct {
-	level   bool
-	driven  bool
-	failNow bool
-}
-
-func (p *fakePin) Set(high bool) error {
-	if p.failNow {
-		return errPin
-	}
-	p.level = high
-	p.driven = true
-	return nil
-}
-
-var errPin = errFake("pin failure")
-
-type errFake string
-
-func (e errFake) Error() string { return string(e) }
-
-// TestV5GPIOActiveHigh checks the enable/auton line levels for every output, with
-// active-high wiring.
-func TestV5GPIOActiveHigh(t *testing.T) {
-	en, au := &fakePin{}, &fakePin{}
-	d, err := driver.NewV5GPIO(en, au, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Constructed safe: both deasserted (low for active-high).
-	if en.level || au.level {
-		t.Fatalf("after construct: enable=%v auton=%v, want both low", en.level, au.level)
-	}
-
-	cases := []struct {
-		name             string
-		out              match.Output
-		wantEn, wantAuto bool
-	}{
-		{"disabled", match.Output{Enabled: false, Mode: match.ModeDisabled}, false, false},
-		{"autonomous", match.Output{Enabled: true, Mode: match.ModeAutonomous}, true, true},
-		{"driver", match.Output{Enabled: true, Mode: match.ModeDriver}, true, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := d.Apply(tc.out); err != nil {
-				t.Fatal(err)
-			}
-			if en.level != tc.wantEn || au.level != tc.wantAuto {
-				t.Fatalf("enable=%v auton=%v, want enable=%v auton=%v",
-					en.level, au.level, tc.wantEn, tc.wantAuto)
-			}
-		})
-	}
-}
-
-// TestV5GPIOActiveLow verifies the level inversion for active-low wiring.
-func TestV5GPIOActiveLow(t *testing.T) {
-	en, au := &fakePin{}, &fakePin{}
-	d, err := driver.NewV5GPIO(en, au, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Disabled with active-low means lines are HIGH (deasserted).
-	if !en.level || !au.level {
-		t.Fatalf("active-low disabled: enable=%v auton=%v, want both high", en.level, au.level)
-	}
-	if err := d.Apply(match.Output{Enabled: true, Mode: match.ModeDriver}); err != nil {
-		t.Fatal(err)
-	}
-	// Enabled asserts enable (low), driver mode deasserts auton (high).
-	if en.level || !au.level {
-		t.Fatalf("active-low driver: enable=%v auton=%v, want enable low, auton high", en.level, au.level)
-	}
-}
-
-func TestV5GPIORequiresPins(t *testing.T) {
-	if _, err := driver.NewV5GPIO(nil, &fakePin{}, true); err == nil {
-		t.Fatal("expected error with nil enable pin")
-	}
-}
-
 func TestMockRecords(t *testing.T) {
 	m := driver.NewMock()
-	_ = m.Apply(match.Output{Enabled: true, Mode: match.ModeDriver})
-	_ = m.Apply(match.Output{})
+	_ = m.Apply(true, match.ModeDriver)
+	_ = m.Apply(false, match.ModeNone)
 	if len(m.Applied) != 2 {
 		t.Fatalf("applied: got %d want 2", len(m.Applied))
 	}
@@ -122,5 +41,106 @@ func TestMockRecords(t *testing.T) {
 	_ = m.Close()
 	if !m.Closed {
 		t.Fatal("expected Closed")
+	}
+}
+
+// bufPort is an in-memory Port for testing V5USB without real hardware.
+type bufPort struct{ bytes.Buffer }
+
+func (p *bufPort) Write(b []byte) (int, error) { return p.Buffer.Write(b) }
+
+func TestV5USBPacketDisabled(t *testing.T) {
+	p := &bufPort{}
+	if _, err := driver.NewV5USB(p); err != nil {
+		t.Fatal(err)
+	}
+	// NewV5USB sends a disabled packet on construction.
+	checkPacket(t, p.Bytes(), false, match.ModeNone)
+}
+
+func TestV5USBPacketAutonomous(t *testing.T) {
+	p := &bufPort{}
+	d, err := driver.NewV5USB(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Reset()
+	if err := d.Apply(true, match.ModeAutonomous); err != nil {
+		t.Fatal(err)
+	}
+	checkPacket(t, p.Bytes(), true, match.ModeAutonomous)
+}
+
+func TestV5USBPacketDriver(t *testing.T) {
+	p := &bufPort{}
+	d, err := driver.NewV5USB(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Reset()
+	if err := d.Apply(true, match.ModeDriver); err != nil {
+		t.Fatal(err)
+	}
+	checkPacket(t, p.Bytes(), true, match.ModeDriver)
+}
+
+// checkPacket verifies a 14-byte V5 USB serial packet.
+func checkPacket(t *testing.T, pkt []byte, enabled bool, mode match.Mode) {
+	t.Helper()
+	if len(pkt) != 14 {
+		t.Fatalf("packet length: got %d want 14", len(pkt))
+	}
+	// Magic header.
+	want := []byte{0xC9, 0x36, 0xB8, 0x47, 0x58, 0xC1, 0x05}
+	for i, b := range want {
+		if pkt[i] != b {
+			t.Fatalf("header byte %d: got 0x%02X want 0x%02X", i, pkt[i], b)
+		}
+	}
+	// State byte.
+	var wantState byte
+	switch {
+	case !enabled:
+		wantState = 0x0B
+	case mode == match.ModeAutonomous:
+		wantState = 0x0A
+	default:
+		wantState = 0x08
+	}
+	if pkt[7] != wantState {
+		t.Fatalf("state byte: got 0x%02X want 0x%02X", pkt[7], wantState)
+	}
+	// Zero padding.
+	for i := 8; i < 12; i++ {
+		if pkt[i] != 0 {
+			t.Fatalf("padding byte %d: got 0x%02X", i, pkt[i])
+		}
+	}
+	// CRC16/CCITT-FALSE over first 12 bytes — re-verify independently.
+	crc := crc16CCITT(pkt[:12])
+	got := binary.BigEndian.Uint16(pkt[12:])
+	if got != crc {
+		t.Fatalf("CRC: got 0x%04X want 0x%04X", got, crc)
+	}
+}
+
+func crc16CCITT(data []byte) uint16 {
+	crc := uint16(0xFFFF)
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+
+func TestV5USBRequiresPort(t *testing.T) {
+	if _, err := driver.NewV5USB(nil); err == nil {
+		t.Fatal("expected error with nil port")
 	}
 }

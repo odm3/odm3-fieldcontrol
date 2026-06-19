@@ -1,346 +1,161 @@
-// Package match implements an authoritative single-match state machine for
-// RECF Achieve Pinnacle field control. The live match runs on the local clock
-// so a dropped portal connection cannot affect match progression.
 package match
 
-import (
-	"errors"
-	"fmt"
-	"time"
-)
+import "time"
 
-// Clock is injected to allow deterministic testing.
-type Clock interface {
-	Now() time.Time
-}
-
-// RealClock implements Clock using the system clock.
-type RealClock struct{}
-
-func (RealClock) Now() time.Time { return time.Now() }
-
-// Phase represents the current state of the match state machine.
-type Phase int
+// Type is the kind of match being run.
+type Type int
 
 const (
-	PhaseIdle       Phase = iota // no match loaded
-	PhasePreMatch                // match loaded, waiting for start
-	PhaseAutonomous              // robots enabled, autonomous mode
-	PhaseTransition              // brief gap between auto and driver, robots disabled
-	PhaseDriver                  // robots enabled, driver mode
-	PhaseEnded                   // match over
-	PhaseEStop                   // latched disabled, overrides everything
-	PhaseFault                   // mid-match reboot recovery
-)
-
-func (p Phase) String() string {
-	switch p {
-	case PhaseIdle:
-		return "idle"
-	case PhasePreMatch:
-		return "pre_match"
-	case PhaseAutonomous:
-		return "autonomous"
-	case PhaseTransition:
-		return "transition"
-	case PhaseDriver:
-		return "driver"
-	case PhaseEnded:
-		return "ended"
-	case PhaseEStop:
-		return "estop"
-	case PhaseFault:
-		return "fault"
-	}
-	return fmt.Sprintf("Phase(%d)", int(p))
-}
-
-// Mode is the robot enable mode communicated to field hardware.
-type Mode int
-
-const (
-	ModeDisabled Mode = iota
-	ModeAutonomous
-	ModeDriver
-)
-
-func (m Mode) String() string {
-	switch m {
-	case ModeDisabled:
-		return "disabled"
-	case ModeAutonomous:
-		return "autonomous"
-	case ModeDriver:
-		return "driver"
-	}
-	return fmt.Sprintf("Mode(%d)", int(m))
-}
-
-// Output is the derived robot enable signal sent to field hardware.
-type Output struct {
-	Enabled bool
-	Mode    Mode
-}
-
-// MatchType defines the sequence of timed phases.
-type MatchType int
-
-const (
-	// Alliance: 15s autonomous + 5s transition + 105s driver.
-	Alliance MatchType = iota
-	// SoloDriving: 60s driver only.
+	TypeUnknown Type = iota
+	// Alliance is a 2v2 match: countdown → autonomous → countdown → driver.
+	// Standard Pinnacle: 3s + 15s + 3s + 105s.
+	Alliance
+	// SoloDriving is a single-robot timed run: countdown → driver only (60s).
 	SoloDriving
-	// SoloCoding: 60s autonomous only.
+	// SoloCoding is a single-robot autonomous-only run: countdown → autonomous (60s).
+	// No driver countdown — there is no driver period.
 	SoloCoding
 )
 
-func (mt MatchType) String() string {
-	switch mt {
+func (t Type) String() string {
+	switch t {
 	case Alliance:
 		return "alliance"
 	case SoloDriving:
 		return "solo_driving"
 	case SoloCoding:
 		return "solo_coding"
-	}
-	return fmt.Sprintf("MatchType(%d)", int(mt))
-}
-
-const transitionDuration = 5 * time.Second
-
-// durations returns the autonomous and driver phase durations for the match type.
-// A zero duration means that phase is skipped.
-func durations(mt MatchType) (auto, driver time.Duration) {
-	switch mt {
-	case Alliance:
-		return 15 * time.Second, 105 * time.Second
-	case SoloDriving:
-		return 0, 60 * time.Second
-	case SoloCoding:
-		return 60 * time.Second, 0
-	}
-	return 0, 0
-}
-
-// MatchID uniquely identifies a match (e.g. "Q-001").
-type MatchID string
-
-// State holds all mutable match state. It is safe to snapshot and restore.
-type State struct {
-	ID        MatchID
-	Type      MatchType
-	Phase     Phase
-	PhaseEnd  time.Time // when the current timed phase ends (zero if untimed)
-	EStopAt   time.Time // when estop was triggered (zero if not estopped)
-	StartedAt time.Time // when the match was started (zero if not started)
-}
-
-// Output derives the current robot enable output from state.
-func (s *State) Output() Output {
-	switch s.Phase {
-	case PhaseAutonomous:
-		return Output{Enabled: true, Mode: ModeAutonomous}
-	case PhaseDriver:
-		return Output{Enabled: true, Mode: ModeDriver}
 	default:
-		return Output{Enabled: false, Mode: ModeDisabled}
+		return "unknown"
 	}
 }
 
-// Machine is the authoritative match state machine.
-// All methods are safe to call from a single goroutine; callers must
-// synchronise if they share a Machine across goroutines.
-type Machine struct {
-	clock   Clock
-	state   State
-	storage Storer
-}
+// Mode is the control mode asserted to robots while the field is enabled.
+type Mode int
 
-// New creates a Machine in PhaseIdle.
-func New(clock Clock, storage Storer) *Machine {
-	return &Machine{clock: clock, storage: storage}
-}
-
-var (
-	ErrWrongPhase  = errors.New("operation not valid in current phase")
-	ErrNoMatch     = errors.New("no match loaded")
-	ErrAlreadyStop = errors.New("estop already active")
+const (
+	ModeNone Mode = iota
+	ModeAutonomous
+	ModeDriver
 )
 
-// Load prepares a new match for the given ID and type, moving to PhasePreMatch.
-//
-// Load is only valid from a clean state (Idle, a re-load in PreMatch, or after a
-// completed match in Ended). A latched EStop or a recovered Fault must be cleared
-// with Reset first — Load never clears them (DESIGN §5, §10).
-func (m *Machine) Load(id MatchID, mt MatchType) error {
-	switch m.state.Phase {
-	case PhaseIdle, PhasePreMatch, PhaseEnded:
-		// allowed
+func (m Mode) String() string {
+	switch m {
+	case ModeAutonomous:
+		return "autonomous"
+	case ModeDriver:
+		return "driver"
 	default:
-		return fmt.Errorf("%w: cannot load in %s (Reset first)", ErrWrongPhase, m.state.Phase)
+		return "none"
 	}
-	m.state = State{
-		ID:    id,
-		Type:  mt,
-		Phase: PhasePreMatch,
-	}
-	return nil
 }
 
-// Start begins the match from PhasePreMatch.
-// It writes a failsafe snapshot before enabling robots.
-func (m *Machine) Start() error {
-	if m.state.Phase != PhasePreMatch {
-		return fmt.Errorf("%w: cannot start in %s", ErrWrongPhase, m.state.Phase)
-	}
+// Phase is the current phase of the match state machine.
+// Robots are only ever enabled in Autonomous and Driver.
+// Countdown phases are disabled — they exist for the field display and
+// driver awareness only; robots see no difference from pre_match.
+type Phase int
 
-	now := m.clock.Now()
-	m.state.StartedAt = now
+const (
+	PhaseIdle            Phase = iota // no match loaded
+	PhasePreMatch                     // loaded, waiting for start (disabled)
+	PhaseCountdownAuton               // 3..2..1 before autonomous (disabled)
+	PhaseAutonomous                   // enabled, autonomous mode
+	PhaseTransition                   // disabled pause between autonomous and driver
+	PhaseCountdownDriver              // 3..2..1 before driver control (disabled)
+	PhaseDriver                       // enabled, driver control
+	PhaseEnded                        // match completed normally (disabled)
+	PhaseEstop                        // emergency stop, latched (disabled)
+	PhaseFault                        // recovered from interruption; awaits operator (disabled)
+)
 
-	auto, driver := durations(m.state.Type)
-
-	if auto > 0 {
-		m.state.Phase = PhaseAutonomous
-		m.state.PhaseEnd = now.Add(auto)
-	} else if driver > 0 {
-		m.state.Phase = PhaseDriver
-		m.state.PhaseEnd = now.Add(driver)
-	} else {
-		m.state.Phase = PhaseEnded
-		m.state.PhaseEnd = time.Time{}
-	}
-
-	// Persist failsafe snapshot before robots go live.
-	if m.storage != nil {
-		snap := m.state
-		snap.Phase = PhaseFault // reboot during match → fault
-		if err := m.storage.Save(snap); err != nil {
-			return fmt.Errorf("failsafe snapshot: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// Tick advances phase transitions based on the current clock time.
-// Call this periodically (e.g. every 100 ms) from the match loop.
-func (m *Machine) Tick() {
-	if m.state.PhaseEnd.IsZero() {
-		return
-	}
-	now := m.clock.Now()
-	if now.Before(m.state.PhaseEnd) {
-		return
-	}
-	m.advance()
-}
-
-// advance moves to the next logical phase when a timed phase expires.
-func (m *Machine) advance() {
-	_, driver := durations(m.state.Type)
-	now := m.clock.Now()
-
-	switch m.state.Phase {
+func (p Phase) String() string {
+	switch p {
+	case PhasePreMatch:
+		return "pre_match"
+	case PhaseCountdownAuton:
+		return "countdown_auton"
 	case PhaseAutonomous:
-		if driver > 0 {
-			m.state.Phase = PhaseTransition
-			m.state.PhaseEnd = m.state.PhaseEnd.Add(transitionDuration)
-		} else {
-			m.endMatch()
-		}
+		return "autonomous"
 	case PhaseTransition:
-		m.state.Phase = PhaseDriver
-		m.state.PhaseEnd = now.Add(driver)
+		return "transition"
+	case PhaseCountdownDriver:
+		return "countdown_driver"
 	case PhaseDriver:
-		m.endMatch()
+		return "driver"
+	case PhaseEnded:
+		return "ended"
+	case PhaseEstop:
+		return "estop"
+	case PhaseFault:
+		return "fault"
+	default:
+		return "idle"
 	}
 }
 
-func (m *Machine) endMatch() {
-	m.state.Phase = PhaseEnded
-	m.state.PhaseEnd = time.Time{}
-	if m.storage != nil {
-		_ = m.storage.Clear()
+// Config fully describes a match. The portal pushes this at load time; once the
+// Machine has it, the match can be run to completion with no further input.
+//
+// Countdown phases are disabled and exist only for field display / driver awareness.
+// Robots see no signal difference between pre_match and a countdown phase.
+type Config struct {
+	MatchID         string
+	Type            Type
+	CountdownAuton  time.Duration // disabled countdown before autonomous (default 3s)
+	Autonomous      time.Duration
+	Transition      time.Duration // disabled gap between auton and driver countdown (may be 0)
+	CountdownDriver time.Duration // disabled countdown before driver control (default 3s; 0 for SoloCoding)
+	Driver          time.Duration
+}
+
+// Standard RECF Achieve Pinnacle durations.
+
+// AllianceConfig returns a standard 2v2 match:
+// 3s countdown → 15s autonomous → 3s countdown → 105s driver.
+func AllianceConfig(matchID string) Config {
+	return Config{
+		MatchID:         matchID,
+		Type:            Alliance,
+		CountdownAuton:  3 * time.Second,
+		Autonomous:      15 * time.Second,
+		Transition:      0,
+		CountdownDriver: 3 * time.Second,
+		Driver:          105 * time.Second,
 	}
 }
 
-// EStop triggers an emergency stop. Robots are immediately disabled and the
-// estop latches — it is cleared only by Reset (DESIGN §5, §10).
-func (m *Machine) EStop() error {
-	if m.state.Phase == PhaseEStop {
-		return ErrAlreadyStop
-	}
-	if m.state.Phase == PhaseIdle {
-		return fmt.Errorf("%w: no match to estop", ErrNoMatch)
-	}
-	m.state.EStopAt = m.clock.Now()
-	m.state.Phase = PhaseEStop
-	m.state.PhaseEnd = time.Time{}
-	return nil
-}
-
-// Abort ends the current match immediately (e.g. field fault, replay needed).
-// Returns to PhaseEnded; the operator can then Load a new match.
-func (m *Machine) Abort() error {
-	switch m.state.Phase {
-	case PhaseIdle, PhaseEnded:
-		return fmt.Errorf("%w: nothing to abort", ErrWrongPhase)
-	}
-	m.endMatch()
-	return nil
-}
-
-// Reset returns the machine to Idle from any state. It is the only way to clear
-// a latched EStop or a recovered Fault (DESIGN §5, §10), and it discards any
-// failsafe snapshot. After Reset the operator may Load a fresh match (or replay).
-func (m *Machine) Reset() {
-	m.state = State{}
-	if m.storage != nil {
-		_ = m.storage.Clear()
+// SoloDrivingConfig returns a 60s driver-only skills run:
+// 3s countdown → 60s driver.
+func SoloDrivingConfig(matchID string) Config {
+	return Config{
+		MatchID:        matchID,
+		Type:           SoloDriving,
+		CountdownAuton: 3 * time.Second, // countdown before the run starts
+		Driver:         60 * time.Second,
 	}
 }
 
-// Remaining reports how much time is left in the current timed phase, or zero if
-// the current phase is untimed (idle, pre_match, transition-less ends, estop, fault,
-// ended). It is derived purely from the local clock so it is unaffected by network
-// state, and is the value displays interpolate from (DESIGN §7).
-func (m *Machine) Remaining() time.Duration {
-	if m.state.PhaseEnd.IsZero() {
-		return 0
+// SoloCodingConfig returns a 60s autonomous-only skills run:
+// 3s countdown → 60s autonomous. No driver countdown (no driver period).
+func SoloCodingConfig(matchID string) Config {
+	return Config{
+		MatchID:        matchID,
+		Type:           SoloCoding,
+		CountdownAuton: 3 * time.Second,
+		Autonomous:     60 * time.Second,
 	}
-	d := m.state.PhaseEnd.Sub(m.clock.Now())
-	if d < 0 {
-		return 0
-	}
-	return d
 }
 
-// State returns a copy of the current machine state.
-func (m *Machine) State() State {
-	return m.state
-}
-
-// Output returns the current derived robot enable output.
-func (m *Machine) Output() Output {
-	return m.state.Output()
-}
-
-// RestoreFailsafe loads a previously saved failsafe snapshot.
-// The machine comes up in PhaseFault with robots disabled.
-// Returns false if no snapshot exists.
-func (m *Machine) RestoreFailsafe() (bool, error) {
-	if m.storage == nil {
-		return false, nil
-	}
-	snap, ok, err := m.storage.Load()
-	if err != nil {
-		return false, fmt.Errorf("failsafe restore: %w", err)
-	}
-	if !ok {
-		return false, nil
-	}
-	m.state = snap
-	m.state.Phase = PhaseFault
-	m.state.PhaseEnd = time.Time{}
-	return true, nil
+// State is the output the driver layer and display clients consume.
+// Enabled and Mode are the two field control signals every controller understands.
+// Remaining is the time left in the current phase (countdown or enabled);
+// CountdownRemaining is non-zero only during a countdown phase.
+type State struct {
+	MatchID            string
+	Phase              Phase
+	Enabled            bool
+	Mode               Mode
+	Remaining          time.Duration // time left in current enabled phase
+	CountdownRemaining time.Duration // time left in countdown (display use)
 }

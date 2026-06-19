@@ -31,10 +31,9 @@ func drainCommands(t *testing.T, fieldEnd *transport.ChanConn, rl *field.RunLoop
 
 // TestControllerDrivesField wires the portal's FieldController to a field RunLoop
 // over the in-process control plane and verifies a Load+Start command sequence
-// reaches the machine and the resulting state publishes back up (DESIGN §6).
+// reaches the machine and the resulting state publishes back up (DESIGN §7).
 func TestControllerDrivesField(t *testing.T) {
-	clk := fixedClock{epoch}
-	m := match.New(clk, &match.MemStorer{})
+	m := match.New(fixedClock{epoch})
 	portalEnd, fieldEnd := transport.Pipe()
 
 	fc := portal.NewFieldController(portalEnd)
@@ -48,10 +47,14 @@ func TestControllerDrivesField(t *testing.T) {
 	}
 	drainCommands(t, fieldEnd, rl, 2)
 
-	// Field advances and publishes state upstream.
+	// Field advances: first tick lands in countdown_auton (disabled).
 	msg, err := rl.Step()
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Verify the state before publishing.
+	if msg.Phase != match.PhaseCountdownAuton || msg.Enabled {
+		t.Fatalf("expected countdown_auton disabled, got %+v", msg)
 	}
 	env, err := contract.EncodeState(msg)
 	if err != nil {
@@ -65,10 +68,10 @@ func TestControllerDrivesField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Phase != match.PhaseAutonomous || !got.Enabled || got.MatchID != "Q-1" {
+	if got.Phase != match.PhaseCountdownAuton || got.MatchID != "Q-1" {
 		t.Fatalf("portal observed wrong state: %+v", got)
 	}
-	if last, seen := fc.Last(); !seen || last.Phase != match.PhaseAutonomous {
+	if last, seen := fc.Last(); !seen || last.Phase != match.PhaseCountdownAuton {
 		t.Fatalf("Last() should cache observed state: %+v seen=%v", last, seen)
 	}
 }
