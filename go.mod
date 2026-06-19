@@ -1,3 +1,3 @@
-module github.com/odm3/odm3-fieldcontrol
+module github.com/odm3/e6events/fieldcontrol
 
 go 1.22

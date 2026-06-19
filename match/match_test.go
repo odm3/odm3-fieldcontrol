@@ -4,14 +4,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odm3/odm3-fieldcontrol/match"
+	"github.com/odm3/e6events/fieldcontrol/match"
 )
 
 // manualClock is a Clock that advances only when told to, for deterministic tests.
 type manualClock struct{ t time.Time }
 
-func newClock(t time.Time) *manualClock     { return &manualClock{t: t} }
-func (c *manualClock) Now() time.Time       { return c.t }
+func newClock(t time.Time) *manualClock        { return &manualClock{t: t} }
+func (c *manualClock) Now() time.Time          { return c.t }
 func (c *manualClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
 
 var epoch = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -155,7 +155,15 @@ func TestEStopDuringAutonomous(t *testing.T) {
 		t.Fatalf("expected ErrAlreadyStop, got %v", err)
 	}
 
-	// Load new match clears estop.
+	// EStop is latched: Load is refused until the operator Resets (DESIGN §5).
+	if err := m.Load("Q-002R", match.Alliance); err == nil {
+		t.Fatal("expected Load to be refused while estopped")
+	}
+	assertPhase(t, m, match.PhaseEStop)
+
+	// Reset clears the latch, then Load works.
+	m.Reset()
+	assertPhase(t, m, match.PhaseIdle)
 	if err := m.Load("Q-002R", match.Alliance); err != nil {
 		t.Fatal(err)
 	}
@@ -313,8 +321,8 @@ func TestNetworkDropCase(t *testing.T) {
 	assertPhase(t, m, match.PhaseEnded)
 }
 
-// TestLoadClearsEStop verifies that loading a new match after estop resets state.
-func TestLoadClearsEStop(t *testing.T) {
+// TestResetClearsEStop verifies that only Reset (not Load) clears a latched estop.
+func TestResetClearsEStop(t *testing.T) {
 	c := newClock(epoch)
 	m, _ := newMachine(c)
 
@@ -323,6 +331,15 @@ func TestLoadClearsEStop(t *testing.T) {
 	m.EStop()
 	assertPhase(t, m, match.PhaseEStop)
 
+	// Load is refused while latched.
+	if err := m.Load("Q-008R", match.SoloDriving); err == nil {
+		t.Fatal("expected Load to be refused while estopped")
+	}
+
+	// Reset clears the latch.
+	m.Reset()
+	assertPhase(t, m, match.PhaseIdle)
+
 	if err := m.Load("Q-008R", match.SoloDriving); err != nil {
 		t.Fatal(err)
 	}
@@ -330,6 +347,65 @@ func TestLoadClearsEStop(t *testing.T) {
 	if s := m.State(); s.ID != "Q-008R" {
 		t.Fatalf("expected new match ID, got %s", s.ID)
 	}
+}
+
+// TestRemaining verifies the local-clock-derived remaining-time readout.
+func TestRemaining(t *testing.T) {
+	c := newClock(epoch)
+	m, _ := newMachine(c)
+
+	if got := m.Remaining(); got != 0 {
+		t.Fatalf("idle remaining: got %s, want 0", got)
+	}
+
+	m.Load("Q-009", match.Alliance)
+	m.Start() // 15s autonomous
+	if got := m.Remaining(); got != 15*time.Second {
+		t.Fatalf("auto remaining at start: got %s, want 15s", got)
+	}
+
+	c.Advance(10 * time.Second)
+	if got := m.Remaining(); got != 5*time.Second {
+		t.Fatalf("auto remaining after 10s: got %s, want 5s", got)
+	}
+
+	// Past expiry but before Tick, remaining clamps to zero (never negative).
+	c.Advance(10 * time.Second)
+	if got := m.Remaining(); got != 0 {
+		t.Fatalf("remaining past expiry: got %s, want 0", got)
+	}
+}
+
+// TestFailsafeRestoreThenReset verifies the operator replay path: a rebooted
+// machine comes up in Fault, and Reset returns it to a loadable Idle state.
+func TestFailsafeRestoreThenReset(t *testing.T) {
+	c := newClock(epoch)
+	store := &match.MemStorer{}
+	m := match.New(c, store)
+
+	m.Load("Q-010", match.Alliance)
+	m.Start()
+
+	// Reboot.
+	m2 := match.New(c, store)
+	restored, err := m2.RestoreFailsafe()
+	if err != nil || !restored {
+		t.Fatalf("restore failed: restored=%v err=%v", restored, err)
+	}
+	assertPhase(t, m2, match.PhaseFault)
+
+	// Load is refused in fault until the operator decides.
+	if err := m2.Load("Q-010", match.Alliance); err == nil {
+		t.Fatal("expected Load to be refused in fault")
+	}
+
+	// Operator chooses to replay: Reset then Load the same match ID.
+	m2.Reset()
+	assertPhase(t, m2, match.PhaseIdle)
+	if err := m2.Load("Q-010", match.Alliance); err != nil {
+		t.Fatal(err)
+	}
+	assertPhase(t, m2, match.PhasePreMatch)
 }
 
 // TestEStopFromIdle errors gracefully.

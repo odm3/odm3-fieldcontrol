@@ -23,14 +23,14 @@ func (RealClock) Now() time.Time { return time.Now() }
 type Phase int
 
 const (
-	PhaseIdle      Phase = iota // no match loaded
-	PhasePreMatch               // match loaded, waiting for start
-	PhaseAutonomous             // robots enabled, autonomous mode
-	PhaseTransition             // brief gap between auto and driver, robots disabled
-	PhaseDriver                 // robots enabled, driver mode
-	PhaseEnded                  // match over
-	PhaseEStop                  // latched disabled, overrides everything
-	PhaseFault                  // mid-match reboot recovery
+	PhaseIdle       Phase = iota // no match loaded
+	PhasePreMatch                // match loaded, waiting for start
+	PhaseAutonomous              // robots enabled, autonomous mode
+	PhaseTransition              // brief gap between auto and driver, robots disabled
+	PhaseDriver                  // robots enabled, driver mode
+	PhaseEnded                   // match over
+	PhaseEStop                   // latched disabled, overrides everything
+	PhaseFault                   // mid-match reboot recovery
 )
 
 func (p Phase) String() string {
@@ -59,7 +59,7 @@ func (p Phase) String() string {
 type Mode int
 
 const (
-	ModeDisabled  Mode = iota
+	ModeDisabled Mode = iota
 	ModeAutonomous
 	ModeDriver
 )
@@ -168,13 +168,16 @@ var (
 )
 
 // Load prepares a new match for the given ID and type, moving to PhasePreMatch.
-// Clears any prior EStop or Fault.
+//
+// Load is only valid from a clean state (Idle, a re-load in PreMatch, or after a
+// completed match in Ended). A latched EStop or a recovered Fault must be cleared
+// with Reset first — Load never clears them (DESIGN §5, §10).
 func (m *Machine) Load(id MatchID, mt MatchType) error {
 	switch m.state.Phase {
-	case PhaseIdle, PhaseEnded, PhaseEStop, PhaseFault:
+	case PhaseIdle, PhasePreMatch, PhaseEnded:
 		// allowed
 	default:
-		return fmt.Errorf("%w: cannot load in %s", ErrWrongPhase, m.state.Phase)
+		return fmt.Errorf("%w: cannot load in %s (Reset first)", ErrWrongPhase, m.state.Phase)
 	}
 	m.state = State{
 		ID:    id,
@@ -262,7 +265,7 @@ func (m *Machine) endMatch() {
 }
 
 // EStop triggers an emergency stop. Robots are immediately disabled and the
-// estop latches — it cannot be cleared except by loading a new match.
+// estop latches — it is cleared only by Reset (DESIGN §5, §10).
 func (m *Machine) EStop() error {
 	if m.state.Phase == PhaseEStop {
 		return ErrAlreadyStop
@@ -285,6 +288,31 @@ func (m *Machine) Abort() error {
 	}
 	m.endMatch()
 	return nil
+}
+
+// Reset returns the machine to Idle from any state. It is the only way to clear
+// a latched EStop or a recovered Fault (DESIGN §5, §10), and it discards any
+// failsafe snapshot. After Reset the operator may Load a fresh match (or replay).
+func (m *Machine) Reset() {
+	m.state = State{}
+	if m.storage != nil {
+		_ = m.storage.Clear()
+	}
+}
+
+// Remaining reports how much time is left in the current timed phase, or zero if
+// the current phase is untimed (idle, pre_match, transition-less ends, estop, fault,
+// ended). It is derived purely from the local clock so it is unaffected by network
+// state, and is the value displays interpolate from (DESIGN §7).
+func (m *Machine) Remaining() time.Duration {
+	if m.state.PhaseEnd.IsZero() {
+		return 0
+	}
+	d := m.state.PhaseEnd.Sub(m.clock.Now())
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // State returns a copy of the current machine state.
